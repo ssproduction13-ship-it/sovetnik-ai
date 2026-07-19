@@ -4,20 +4,7 @@ import { db } from "@workspace/db";
 import { conversations, messages, telegramSessions } from "@workspace/db";
 import { eq, asc } from "drizzle-orm";
 import { logger } from "./logger";
-import { streamGroq, type ChatMessage } from "./groq";
-
-const SYSTEM_PROMPT = `You are Советник — a personal AI advisor for a Russian-speaking user. You speak Russian by default unless the user writes in another language.
-
-You are simultaneously:
-- A real estate expert helping sell their house in Tyumen (100 sq m, 5 million rubles asking price, located 25 km from the city center). Help with: writing listings, negotiating strategies, preparing documents, market analysis.
-- A personal finance advisor: budgeting, income/expense planning, financial goals.
-- An investment analyst: Russian and international markets, stocks, bonds, real estate investment, risk assessment.
-- A business analyst: P&L analysis, revenue forecasts, cost optimization, business strategy.
-- An accountant: tax planning, expense reporting, financial statements.
-
-Be specific, practical, and concise. Provide real, actionable advice. Use numbers and examples. Never refuse to help with financial analysis or give vague disclaimers instead of real advice.
-
-You are responding via Telegram. Keep responses clear and well-structured. Use plain text formatting (avoid markdown that doesn't render in Telegram, but use line breaks and lists for clarity).`;
+import { runMultiAgent, type ChatMessage } from "./agents";
 
 async function getOrCreateConversation(chatId: number, chatTitle: string): Promise<number> {
   const existing = await db.query.telegramSessions.findFirst({
@@ -49,13 +36,11 @@ export function startTelegramBot(): void {
 
   bot.start(async (ctx) => {
     await ctx.reply(
-      "Привет! Я Советник — твой личный AI-помощник по финансам, недвижимости и бизнесу.\n\n" +
-      "Я знаю о твоём доме в Тюмени и готов помочь с:\n" +
-      "• Продажей дома (объявления, переговоры, документы)\n" +
-      "• Личным бюджетом и планированием\n" +
-      "• Инвестициями (российский и международный рынок)\n" +
-      "• Бизнес-аналитикой (P&L, прогнозы)\n\n" +
-      "Просто напиши свой вопрос."
+      "Привет! Я Советник — команда из трёх AI-специалистов:\n\n" +
+      "💪 Здоровье & Спорт\n" +
+      "💰 Финансы & Бизнес\n" +
+      "🧠 Личные дела\n\n" +
+      "Задай любой вопрос — все трое обсудят и дадут общий ответ."
     );
   });
 
@@ -83,7 +68,7 @@ export function startTelegramBot(): void {
       "Команды:\n" +
       "/new — начать новый разговор (очистить контекст)\n" +
       "/help — эта справка\n\n" +
-      "Просто пиши любой вопрос — я отвечу."
+      "Просто пиши любой вопрос — специалисты обсудят и ответят совместно."
     );
   });
 
@@ -103,63 +88,43 @@ export function startTelegramBot(): void {
         content: userText,
       });
 
+      // Load history for context
       const history = await db
         .select()
         .from(messages)
         .where(eq(messages.conversationId, conversationId))
         .orderBy(asc(messages.createdAt));
 
-      const chatMessages: ChatMessage[] = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history.map((m) => ({
-          role: m.role as "user" | "assistant",
-          content: m.content,
-        })),
-      ];
+      const chatMessages: ChatMessage[] = history.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      }));
 
-      let fullResponse = "";
-      let sentMessage: Awaited<ReturnType<typeof ctx.reply>> | null = null;
-      let lastEditAt = 0;
-      const EDIT_INTERVAL_MS = 1000;
+      // Show "agents are thinking" status
+      const statusMsg = await ctx.reply("💪 💰 🧠 Специалисты обсуждают...");
 
-      for await (const chunk of streamGroq(chatMessages)) {
-        fullResponse += chunk;
-        const now = Date.now();
-        if (!sentMessage) {
-          sentMessage = await ctx.reply(fullResponse + " ▌");
-          lastEditAt = now;
-        } else if (now - lastEditAt > EDIT_INTERVAL_MS) {
-          try {
-            await ctx.telegram.editMessageText(
-              chatId,
-              sentMessage.message_id,
-              undefined,
-              fullResponse + " ▌"
-            );
-            lastEditAt = now;
-          } catch {
-            // ignore edit conflicts
-          }
-        }
+      // Run multi-agent pipeline
+      const { agentResponses, finalAnswer } = await runMultiAgent(chatMessages);
+
+      // Build the full message: individual opinions + combined answer
+      const agentBlock = agentResponses
+        .map((r) => `${r.agent.emoji} ${r.agent.name}:\n${r.text}`)
+        .join("\n\n");
+
+      const fullMessage = `${agentBlock}\n\n─────────────────\n✅ Общий ответ:\n\n${finalAnswer}`;
+
+      // Replace status message with the real answer
+      try {
+        await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined, fullMessage);
+      } catch {
+        await ctx.reply(fullMessage);
       }
 
-      if (sentMessage && fullResponse) {
-        try {
-          await ctx.telegram.editMessageText(
-            chatId,
-            sentMessage.message_id,
-            undefined,
-            fullResponse
-          );
-        } catch { /* ignore */ }
-      } else if (!sentMessage && fullResponse) {
-        await ctx.reply(fullResponse);
-      }
-
+      // Save assistant response to history
       await db.insert(messages).values({
         conversationId,
         role: "assistant",
-        content: fullResponse,
+        content: fullMessage,
       });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
