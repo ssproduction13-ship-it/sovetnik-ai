@@ -4,7 +4,7 @@ import { db } from "@workspace/db";
 import { conversations, messages, telegramSessions } from "@workspace/db";
 import { eq, asc } from "drizzle-orm";
 import { logger } from "./logger";
-import { streamGemini, type GeminiMessage } from "./gemini";
+import { streamGroq, type ChatMessage } from "./groq";
 
 const SYSTEM_PROMPT = `You are Советник — a personal AI advisor for a Russian-speaking user. You speak Russian by default unless the user writes in another language.
 
@@ -109,17 +109,20 @@ export function startTelegramBot(): void {
         .where(eq(messages.conversationId, conversationId))
         .orderBy(asc(messages.createdAt));
 
-      const geminiMessages: GeminiMessage[] = history.map((m) => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }],
-      }));
+      const chatMessages: ChatMessage[] = [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history.map((m) => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        })),
+      ];
 
       let fullResponse = "";
       let sentMessage: Awaited<ReturnType<typeof ctx.reply>> | null = null;
       let lastEditAt = 0;
       const EDIT_INTERVAL_MS = 1000;
 
-      for await (const chunk of streamGemini(geminiMessages, SYSTEM_PROMPT)) {
+      for await (const chunk of streamGroq(chatMessages)) {
         fullResponse += chunk;
         const now = Date.now();
         if (!sentMessage) {
