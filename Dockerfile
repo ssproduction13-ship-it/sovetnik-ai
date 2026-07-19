@@ -16,6 +16,7 @@ RUN pnpm --filter @workspace/api-server run build
 FROM node:24-slim
 WORKDIR /app
 
-COPY --from=builder /app/artifacts/api-server/dist ./dist
+# Keep the same path as build so pino worker paths resolve correctly
+COPY --from=builder /app/artifacts/api-server/dist ./artifacts/api-server/dist
 
-CMD ["node", "--enable-source-maps", "./dist/index.mjs"]
+CMD ["node", "--enable-source-maps", "./artifacts/api-server/dist/index.mjs"]
