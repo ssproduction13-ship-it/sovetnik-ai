@@ -1,9 +1,9 @@
-import { Telegraf, Context } from "telegraf";
+import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
+import { GoogleGenAI } from "@google/genai";
 import { db } from "@workspace/db";
 import { conversations, messages, telegramSessions } from "@workspace/db";
 import { eq, asc } from "drizzle-orm";
-import { openai } from "@workspace/integrations-openai-ai-server";
 import { logger } from "./logger";
 
 const SYSTEM_PROMPT = `You are Советник — a personal AI advisor for a Russian-speaking user. You speak Russian by default unless the user writes in another language.
@@ -19,11 +19,16 @@ Be specific, practical, and concise. Provide real, actionable advice. Use number
 
 You are responding via Telegram. Keep responses clear and well-structured. Use plain text formatting (avoid markdown that doesn't render in Telegram, but use line breaks and lists for clarity).`;
 
+function getGenAI(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY must be set in environment variables");
+  return new GoogleGenAI({ apiKey });
+}
+
 async function getOrCreateConversation(chatId: number, chatTitle: string): Promise<number> {
   const existing = await db.query.telegramSessions.findFirst({
     where: eq(telegramSessions.telegramChatId, chatId),
   });
-
   if (existing) return existing.conversationId;
 
   const [conv] = await db
@@ -93,40 +98,37 @@ export function startTelegramBot(): void {
     const userText = ctx.message.text;
     const chatTitle = ctx.from?.first_name ?? String(chatId);
 
-    // Show typing indicator
     await ctx.sendChatAction("typing");
 
     try {
       const conversationId = await getOrCreateConversation(chatId, chatTitle);
 
-      // Save user message
       await db.insert(messages).values({
         conversationId,
         role: "user",
         content: userText,
       });
 
-      // Load history
       const history = await db
         .select()
         .from(messages)
         .where(eq(messages.conversationId, conversationId))
         .orderBy(asc(messages.createdAt));
 
-      const chatMessages: { role: "system" | "user" | "assistant"; content: string }[] = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history.map((m) => ({
-          role: m.role as "user" | "assistant",
-          content: m.content,
-        })),
-      ];
+      const genai = getGenAI();
 
-      // Stream response with live message editing
-      const stream = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        max_completion_tokens: 8192,
-        messages: chatMessages,
-        stream: true,
+      const contents = history.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
+
+      const stream = await genai.models.generateContentStream({
+        model: "gemini-2.5-flash",
+        contents,
+        config: {
+          systemInstruction: SYSTEM_PROMPT,
+          maxOutputTokens: 8192,
+        },
       });
 
       let fullResponse = "";
@@ -135,17 +137,14 @@ export function startTelegramBot(): void {
       const EDIT_INTERVAL_MS = 1000;
 
       for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content;
-        if (content) {
-          fullResponse += content;
-
+        const text = chunk.text;
+        if (text) {
+          fullResponse += text;
           const now = Date.now();
           if (!sentMessage) {
-            // Send first chunk as a new message
             sentMessage = await ctx.reply(fullResponse + " ▌");
             lastEditAt = now;
           } else if (now - lastEditAt > EDIT_INTERVAL_MS) {
-            // Edit message periodically to show progress
             try {
               await ctx.telegram.editMessageText(
                 chatId,
@@ -155,13 +154,12 @@ export function startTelegramBot(): void {
               );
               lastEditAt = now;
             } catch {
-              // Ignore edit errors (e.g. message not modified)
+              // ignore edit conflicts
             }
           }
         }
       }
 
-      // Final edit — remove cursor
       if (sentMessage && fullResponse) {
         try {
           await ctx.telegram.editMessageText(
@@ -170,23 +168,20 @@ export function startTelegramBot(): void {
             undefined,
             fullResponse
           );
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       } else if (!sentMessage && fullResponse) {
         await ctx.reply(fullResponse);
       }
 
-      // Save assistant message
       await db.insert(messages).values({
         conversationId,
         role: "assistant",
         content: fullResponse,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Telegram bot error");
-      await ctx.reply(`Произошла ошибка: ${message}`);
+      await ctx.reply(`Произошла ошибка: ${errMsg}`);
     }
   });
 
@@ -196,7 +191,6 @@ export function startTelegramBot(): void {
     logger.error({ err }, "Failed to start Telegram bot");
   });
 
-  // Graceful stop
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 }
