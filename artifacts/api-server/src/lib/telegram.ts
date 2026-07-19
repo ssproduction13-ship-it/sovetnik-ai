@@ -184,8 +184,9 @@ export function startTelegramBot(): void {
         content: fullResponse,
       });
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Telegram bot error");
-      await ctx.reply("Произошла ошибка. Попробуй ещё раз.");
+      await ctx.reply(`Произошла ошибка: ${message}`);
     }
   });
 
