@@ -1,10 +1,10 @@
 import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
-import { GoogleGenAI } from "@google/genai";
 import { db } from "@workspace/db";
 import { conversations, messages, telegramSessions } from "@workspace/db";
 import { eq, asc } from "drizzle-orm";
 import { logger } from "./logger";
+import { streamGemini, type GeminiMessage } from "./gemini";
 
 const SYSTEM_PROMPT = `You are Советник — a personal AI advisor for a Russian-speaking user. You speak Russian by default unless the user writes in another language.
 
@@ -18,12 +18,6 @@ You are simultaneously:
 Be specific, practical, and concise. Provide real, actionable advice. Use numbers and examples. Never refuse to help with financial analysis or give vague disclaimers instead of real advice.
 
 You are responding via Telegram. Keep responses clear and well-structured. Use plain text formatting (avoid markdown that doesn't render in Telegram, but use line breaks and lists for clarity).`;
-
-function getGenAI(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY must be set in environment variables");
-  return new GoogleGenAI({ apiKey });
-}
 
 async function getOrCreateConversation(chatId: number, chatTitle: string): Promise<number> {
   const existing = await db.query.telegramSessions.findFirst({
@@ -115,47 +109,33 @@ export function startTelegramBot(): void {
         .where(eq(messages.conversationId, conversationId))
         .orderBy(asc(messages.createdAt));
 
-      const genai = getGenAI();
-
-      const contents = history.map((m) => ({
+      const geminiMessages: GeminiMessage[] = history.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
         parts: [{ text: m.content }],
       }));
-
-      const stream = await genai.models.generateContentStream({
-        model: "gemini-2.5-flash",
-        contents,
-        config: {
-          systemInstruction: SYSTEM_PROMPT,
-          maxOutputTokens: 8192,
-        },
-      });
 
       let fullResponse = "";
       let sentMessage: Awaited<ReturnType<typeof ctx.reply>> | null = null;
       let lastEditAt = 0;
       const EDIT_INTERVAL_MS = 1000;
 
-      for await (const chunk of stream) {
-        const text = chunk.text;
-        if (text) {
-          fullResponse += text;
-          const now = Date.now();
-          if (!sentMessage) {
-            sentMessage = await ctx.reply(fullResponse + " ▌");
+      for await (const chunk of streamGemini(geminiMessages, SYSTEM_PROMPT)) {
+        fullResponse += chunk;
+        const now = Date.now();
+        if (!sentMessage) {
+          sentMessage = await ctx.reply(fullResponse + " ▌");
+          lastEditAt = now;
+        } else if (now - lastEditAt > EDIT_INTERVAL_MS) {
+          try {
+            await ctx.telegram.editMessageText(
+              chatId,
+              sentMessage.message_id,
+              undefined,
+              fullResponse + " ▌"
+            );
             lastEditAt = now;
-          } else if (now - lastEditAt > EDIT_INTERVAL_MS) {
-            try {
-              await ctx.telegram.editMessageText(
-                chatId,
-                sentMessage.message_id,
-                undefined,
-                fullResponse + " ▌"
-              );
-              lastEditAt = now;
-            } catch {
-              // ignore edit conflicts
-            }
+          } catch {
+            // ignore edit conflicts
           }
         }
       }

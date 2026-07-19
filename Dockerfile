@@ -17,7 +17,5 @@ WORKDIR /app
 # Keep same path as build so pino worker paths resolve correctly
 COPY --from=builder /app/artifacts/api-server/dist ./artifacts/api-server/dist
 
-# Copy node_modules for packages that aren't bundled by esbuild (e.g. @google/genai)
-COPY --from=builder /app/node_modules ./node_modules
 
 CMD ["node", "--enable-source-maps", "./artifacts/api-server/dist/index.mjs"]
