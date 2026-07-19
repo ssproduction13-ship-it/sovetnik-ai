@@ -1,0 +1,12 @@
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "node --enable-source-maps ./dist/index.mjs"
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+
+[[deploy.environmentVariables]]
+name = "NODE_ENV"
+value = "production"
