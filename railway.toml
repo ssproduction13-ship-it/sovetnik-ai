@@ -1,7 +1,3 @@
-[build]
-builder = "IMAGE"
-image = "ghcr.io/ssproduction13-ship-it/sovetnik-ai:latest"
-
 [deploy]
 healthcheckPath = "/api/healthz"
 healthcheckTimeout = 30
