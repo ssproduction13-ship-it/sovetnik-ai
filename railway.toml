@@ -1,6 +1,6 @@
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+builder = "IMAGE"
+image = "ghcr.io/ssproduction13-ship-it/sovetnik-ai:latest"
 
 [deploy]
 healthcheckPath = "/api/healthz"
