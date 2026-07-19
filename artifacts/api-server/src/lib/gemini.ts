@@ -15,7 +15,7 @@ export async function* streamGemini(
   if (!apiKey) throw new Error("GEMINI_API_KEY must be set in Railway variables");
 
   const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:streamGenerateContent?alt=sse&key=${apiKey}`;
 
   const res = await fetch(url, {
     method: "POST",
