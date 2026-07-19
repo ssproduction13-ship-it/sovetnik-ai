@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "AI Financial Advisor"
+version = "1.0.0"
+id = "artifacts/advisor"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22234
+
+[services.development]
+run = "pnpm --filter @workspace/advisor run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/advisor", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/advisor/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22234"
+BASE_PATH = "/"
