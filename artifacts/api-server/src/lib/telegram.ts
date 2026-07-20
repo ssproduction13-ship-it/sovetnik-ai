@@ -4,15 +4,16 @@ import { conversations, messages, telegramSessions } from "@workspace/db";
 import { eq, asc, desc } from "drizzle-orm";
 import { logger } from "./logger";
 import {
-  runAllAgents,
   runSelectedAgents,
   runDiscussion,
   runReactions,
   answerQuestion,
   runSingleAgent,
+  runManager,
   AGENTS,
   ALIAS_MAP,
   type AgentId,
+  type Agent,
   type ChatMessage,
   type AgentAnswer,
   type HireEvent,
@@ -205,17 +206,15 @@ export function startTelegramBot(): void {
   // ── /start ────────────────────────────────────────────────────────────
   bot.start(async (ctx) => {
     await ctx.reply(
-      "Привет! Я Советник — четыре AI-специалиста в одном боте.\n\n" +
+      "Привет! Я Советник.\n\n" +
+      "🧭 Мия — твой личный менеджер. Она всегда на связи и сама решает, кто из команды поможет лучше:\n\n" +
       "💪 Макс — здоровье, спорт, питание\n" +
-      "💰 Аня — финансы, инвестиции, бизнес\n" +
+      "💰 Аня — финансы, расходы, бизнес\n" +
       "🧠 Лёва — задачи, личные вопросы, продуктивность\n" +
       "💻 Дима — программирование, технологии\n\n" +
-      "Как обращаться:\n" +
-      "• Просто пиши — ответят все четверо\n" +
-      "• «Дима, как написать REST API?» или @дима — только Дима\n" +
-      "• «Аня и Дима, что думаете?» — двое выбранных\n" +
-      "• «Обсудите, стоит ли менять стек» — дискуссия между ними\n\n" +
-      "Они умеют записывать расходы, тренировки и задачи — просто напиши об этом.\n\n" +
+      "Просто пиши — Мия разберётся кому передать или ответит сама.\n" +
+      "Хочешь напрямую к специалисту — обратись по имени: «Дима, как написать REST API?»\n" +
+      "Хочешь дискуссию — «Обсудите, стоит ли менять стек»\n\n" +
       "/new — новый разговор  |  /help — справка",
     );
   });
@@ -223,19 +222,20 @@ export function startTelegramBot(): void {
   // ── /help ─────────────────────────────────────────────────────────────
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "Как обращаться:\n\n" +
-      "• Просто вопрос → ответят все четверо независимо\n" +
-      "• Макс, вопрос / @макс → только Макс 💪\n" +
-      "• Аня, вопрос / @аня → только Аня 💰\n" +
-      "• Лёва, вопрос / @лёва → только Лёва 🧠\n" +
-      "• Дима, вопрос / @дима → только Дима 💻\n" +
-      "• Макс и Дима, вопрос → двое выбранных\n" +
-      "• Обсудите [тема] → дискуссия, каждый слышит предыдущих\n\n" +
-      "Что умеют агенты:\n" +
-      "💰 Аня — запишет расходы: «потратил 1500 на продукты»\n" +
-      "💪 Макс — зафиксирует тренировку, попросит уточнения для плана\n" +
+      "Как работает Советник:\n\n" +
+      "🧭 Просто пиши — Мия оценит запрос и либо ответит сама, либо передаст нужному специалисту.\n\n" +
+      "Прямое обращение к специалисту:\n" +
+      "• «Макс, как похудеть?» или @макс → Макс 💪\n" +
+      "• «Аня, мой бюджет» или @аня → Аня 💰\n" +
+      "• «Лёва, добавь задачу» или @лёва → Лёва 🧠\n" +
+      "• «Дима, помоги с кодом» или @дима → Дима 💻\n" +
+      "• «Аня и Дима, вопрос» → оба ответят\n" +
+      "• «Обсудите [тему]» → дискуссия\n\n" +
+      "Что умеют:\n" +
+      "💰 Аня — запишет расход: «потратил 1500 на продукты»\n" +
+      "💪 Макс — зафиксирует тренировку, составит план\n" +
       "🧠 Лёва — добавит задачу или напоминание\n" +
-      "💻 Дима — попросит код/traceback для отладки\n\n" +
+      "💻 Дима — разберёт код, поможет с отладкой\n\n" +
       "/new — начать новый разговор",
     );
   });
@@ -431,11 +431,74 @@ export function startTelegramBot(): void {
       return;
     }
 
-    // ── Multiple agents (subset or all) ──────────────────────────────────
+    // ── No explicit target → Manager decides ────────────────────────────
+    if (effectiveTargets.length === 0) {
+      const managerPlaceholder = await bot.telegram.sendMessage(chatId, "🧭 Мия думает...");
+
+      const decision = await runManager(history, chatId, (agent: Agent, question: string) => {
+        // Fire-and-forget status update when a consultation starts
+        bot.telegram.editMessageText(
+          chatId, managerPlaceholder.message_id, undefined,
+          `🧭 Мия консультирует ${agent.emoji} ${agent.firstName}...`,
+        ).catch(() => {});
+      });
+
+      if (decision.kind === "answer") {
+        // Manager answers directly
+        const reply = `🧭 Мия\n\n${decision.text}`;
+        await sendOrEdit(bot, chatId, managerPlaceholder.message_id, reply);
+        await db.insert(messages).values({ conversationId, role: "assistant", content: reply });
+        return;
+      }
+
+      if (decision.kind === "route") {
+        // Manager introduces the specialist, then specialist answers
+        const specialist = AGENTS[decision.agentId];
+        activeAgent.set(chatId, decision.agentId);
+
+        const introText = decision.intro
+          ? `🧭 Мия\n\n${decision.intro}`
+          : `🧭 Мия\n\nПередаю тебя к ${specialist.firstName} ${specialist.emoji}`;
+        await sendOrEdit(bot, chatId, managerPlaceholder.message_id, introText);
+        await db.insert(messages).values({ conversationId, role: "assistant", content: introText });
+
+        const specPlaceholder = await bot.telegram.sendMessage(chatId, `${specialist.emoji} ${specialist.firstName} думает...`);
+        const { answer, pendingQuestion } = await runSingleAgent(
+          decision.agentId, history, chatId,
+          makeHireHandler(bot, chatId, specialist.firstName, specialist.emoji),
+        );
+
+        if (pendingQuestion) {
+          await setPendingIntent(chatId, { agentId: decision.agentId, originalMessage: rawText });
+          await db.insert(messages).values({ conversationId, role: "assistant", content: pendingQuestion });
+          await sendOrEdit(bot, chatId, specPlaceholder.message_id, `${specialist.emoji} ${specialist.firstName}: ${pendingQuestion}`);
+          return;
+        }
+
+        const specReply = `${specialist.emoji} ${specialist.firstName}\n\n${answer}`;
+        await sendOrEdit(bot, chatId, specPlaceholder.message_id, specReply);
+        await db.insert(messages).values({ conversationId, role: "assistant", content: specReply });
+        return;
+      }
+
+      if (decision.kind === "consult") {
+        // Show each consultation result, then manager's synthesis
+        for (const c of decision.results) {
+          await bot.telegram.sendMessage(chatId, `${c.agent.emoji} ${c.agent.firstName}\n\n${c.answer}`);
+        }
+        const synthesis = `🧭 Мия\n\n${decision.synthesis}`;
+        await sendOrEdit(bot, chatId, managerPlaceholder.message_id, synthesis);
+        const saved =
+          decision.results.map((c) => `${c.agent.emoji} ${c.agent.firstName}\n${c.answer}`).join("\n\n─────\n\n") +
+          `\n\n─────\n\n${synthesis}`;
+        await db.insert(messages).values({ conversationId, role: "assistant", content: saved });
+        return;
+      }
+    }
+
+    // ── Multiple agents (explicit subset) ────────────────────────────────
     activeAgent.delete(chatId);
-    const agentIds: AgentId[] = effectiveTargets.length === 0
-      ? (Object.keys(AGENTS) as AgentId[])
-      : effectiveTargets;
+    const agentIds: AgentId[] = effectiveTargets;
 
     const placeholders: Record<string, number> = {};
     for (const agent of agentIds.map((id) => AGENTS[id])) {
@@ -449,43 +512,7 @@ export function startTelegramBot(): void {
       allAnswers.push({ agent, answer });
     };
 
-    if (agentIds.length === Object.keys(AGENTS).length) {
-      await runAllAgents(history, onDone);
-    } else {
-      await runSelectedAgents(agentIds, history, onDone);
-    }
-
-    // Phase 2 & 3 — reactions and inter-agent questions (all agents only)
-    if (agentIds.length === Object.keys(AGENTS).length) {
-      const reactions = await runReactions(allAnswers);
-      const questions = reactions.filter(
-        (r): r is Extract<typeof reactions[number], { kind: "question" }> => r.kind === "question",
-      );
-      const comments = reactions.filter(
-        (r): r is Extract<typeof reactions[number], { kind: "comment" }> => r.kind === "comment",
-      );
-
-      for (const c of comments) {
-        await bot.telegram.sendMessage(chatId, `${c.agent.emoji} ${c.agent.firstName}:\n\n${c.text}`);
-      }
-
-      if (questions.length > 0) {
-        const answerMsgIds: number[] = [];
-        for (const q of questions) {
-          await bot.telegram.sendMessage(
-            chatId,
-            `${q.from.emoji}→${q.to.emoji} ${q.from.firstName} спрашивает ${q.to.firstName}:\n\n${q.text}`,
-          );
-          const aMsg = await bot.telegram.sendMessage(chatId, `${q.to.emoji} ${q.to.firstName} отвечает...`);
-          answerMsgIds.push(aMsg.message_id);
-        }
-        const answered = await Promise.all(questions.map((q) => answerQuestion(q)));
-        for (let i = 0; i < answered.length; i++) {
-          const { to, answer } = answered[i];
-          await sendOrEdit(bot, chatId, answerMsgIds[i], `${to.emoji} ${to.firstName}:\n\n${answer}`);
-        }
-      }
-    }
+    await runSelectedAgents(agentIds, history, onDone);
 
     const saved = allAnswers
       .map((a) => `${a.agent.emoji} ${a.agent.firstName}\n${a.answer}`)

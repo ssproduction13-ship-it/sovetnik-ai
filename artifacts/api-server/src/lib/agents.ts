@@ -461,3 +461,110 @@ export async function runSingleAgent(
   const result = await callAgentWithTools(agent, history, userMessage, chatId, onHire);
   return { agent, ...result };
 }
+
+// ── Manager agent ─────────────────────────────────────────────────────────
+//
+// Default entry point when user doesn't explicitly mention a specialist.
+// Manager decides:
+//   [ROUTE:agentId]            — hand off to specialist (they become active agent)
+//   [ASK:agentId:question]     — silent consultation, manager synthesises answer
+//   plain text                 — manager answers directly
+//
+// Multiple [ASK:...] tags are supported (run in parallel).
+// [ROUTE:...] takes priority over [ASK:...] if both appear.
+
+const MANAGER_SYSTEM = `Тебя зовут Мия. Ты — главный менеджер команды AI-советников.
+Ты — первый, кто общается с пользователем. Ты сама решаешь, кто лучше поможет.
+
+Твоя команда:
+  💪 Макс   (health)    — здоровье, спорт, питание, тренировки
+  💰 Аня    (finance)   — финансы, расходы, бизнес, бюджет
+  🧠 Лёва   (personal)  — задачи, личные вопросы, продуктивность, отношения
+  💻 Дима   (tech)      — программирование, код, технологии
+
+Правила:
+1. Если вопрос простой или общий — ответь сама, не более 5 предложений.
+2. Если вопрос явно в компетенции одного специалиста — передай диалог ему:
+   [ROUTE:health] или [ROUTE:finance] или [ROUTE:personal] или [ROUTE:tech]
+   После тега коротко поясни пользователю, к кому переводишь: «Передаю тебя к Максу 💪»
+3. Если нужна консультация специалиста, но ты сама синтезируешь ответ:
+   [ASK:health:конкретный вопрос]
+   Можно несколько тегов. После них дай итоговый ответ пользователю.
+4. Никогда не показывай теги пользователю — только чистый текст.
+5. Отвечай только на русском.`;
+
+const MANAGER_ROUTE_RE = /\[ROUTE:(health|finance|personal|tech)\]/i;
+const MANAGER_ASK_RE = /\[ASK:(health|finance|personal|tech):([^\]]+)\]/gi;
+
+export type ManagerDecision =
+  | { kind: "answer"; text: string }
+  | { kind: "route"; agentId: AgentId; intro: string }
+  | { kind: "consult"; results: Array<{ agent: Agent; question: string; answer: string }>; synthesis: string };
+
+export async function runManager(
+  history: ChatMessage[],
+  chatId: number,
+  onConsult?: (agent: Agent, question: string) => void,
+): Promise<ManagerDecision> {
+  const messages: ChatMessage[] = [
+    { role: "system", content: MANAGER_SYSTEM },
+    ...history,
+  ];
+
+  let firstPass = "";
+  for await (const chunk of streamGroq(messages)) firstPass += chunk;
+  firstPass = firstPass.trim();
+
+  // ── ROUTE — hand off to specialist ───────────────────────────────────
+  const routeMatch = firstPass.match(MANAGER_ROUTE_RE);
+  if (routeMatch) {
+    const agentId = routeMatch[1].toLowerCase() as AgentId;
+    // Strip tag, keep manager's intro text
+    const intro = firstPass.replace(MANAGER_ROUTE_RE, "").replace(/\s{2,}/g, " ").trim();
+    return { kind: "route", agentId, intro };
+  }
+
+  // ── ASK — silent consultations, manager synthesises ──────────────────
+  const askMatches = [...firstPass.matchAll(MANAGER_ASK_RE)];
+  if (askMatches.length > 0) {
+    const lastUser = [...history].reverse().find((m) => m.role === "user");
+    const userMessage = typeof lastUser?.content === "string" ? lastUser.content : "";
+
+    const consultResults = await Promise.all(
+      askMatches.map(async ([, id, question]) => {
+        const agent = AGENTS[id.toLowerCase() as AgentId];
+        onConsult?.(agent, question.trim());
+        const answer = await spawnSpecialist(
+          agent.emoji,
+          agent.name,
+          question.trim(),
+          userMessage,
+        );
+        return { agent, question: question.trim(), answer };
+      }),
+    );
+
+    // Second pass: manager synthesises with specialist answers
+    const consultBlock = consultResults
+      .map((c) => `${c.agent.emoji} ${c.agent.firstName} (${c.agent.name}): ${c.answer}`)
+      .join("\n\n");
+
+    const synthMessages: ChatMessage[] = [
+      { role: "system", content: MANAGER_SYSTEM },
+      ...history,
+      {
+        role: "user",
+        content:
+          `Консультации получены:\n\n${consultBlock}\n\n` +
+          "Теперь дай пользователю итоговый ответ. Без тегов. Максимум 7 предложений.",
+      },
+    ];
+
+    let synthesis = "";
+    for await (const chunk of streamGroq(synthMessages)) synthesis += chunk;
+    return { kind: "consult", results: consultResults, synthesis: synthesis.trim() };
+  }
+
+  // ── Direct answer ─────────────────────────────────────────────────────
+  return { kind: "answer", text: firstPass };
+}
