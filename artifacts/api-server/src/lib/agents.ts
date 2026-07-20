@@ -1,259 +1,206 @@
 /**
- * Multi-agent system with direct addressing and agent-to-agent communication.
+ * Single main agent + specialist sub-agents.
  *
- * Agents can ask each other by including [→ @agent: question] in their response.
- * The orchestrator detects these, routes them, and continues the discussion
- * for up to MAX_ROUNDS rounds before final synthesis.
+ * The main agent ("Советник") talks directly with the user.
+ * When it needs specialist input, it emits consultation tags:
+ *   [→ @health: вопрос]
+ *   [→ @finance: вопрос]
+ *   [→ @personal: вопрос]
+ *
+ * The orchestrator detects these, calls specialists in parallel,
+ * injects their answers, then asks the main agent to finalize.
+ * Max MAX_ROUNDS of consultations per turn.
  */
 
 import { streamGroq, type ChatMessage } from "./groq";
 export type { ChatMessage };
 
-export type AgentId = "health" | "finance" | "personal";
+export type SpecialistId = "health" | "finance" | "personal";
 
-export interface Agent {
-  id: AgentId;
+interface Specialist {
+  id: SpecialistId;
   name: string;
   emoji: string;
-  alias: string[]; // recognized @mentions
+  aliases: string[];
   systemPrompt: string;
 }
 
-// Pattern: [→ @finance: how much does this cost?]
-const AGENT_QUESTION_RE = /\[→\s*@(\w+):\s*([^\]]+)\]/g;
+const MAX_ROUNDS = 2;
 
-const MAX_ROUNDS = 3;
+// Pattern: [→ @health: как снизить вес?]
+const CONSULT_RE = /\[→\s*@([\wа-яё]+):\s*([^\]]+)\]/gi;
 
-export const AGENTS: Record<AgentId, Agent> = {
+// ── Specialists ──────────────────────────────────────────────────────────────
+
+const SPECIALISTS: Record<SpecialistId, Specialist> = {
   health: {
     id: "health",
     name: "Здоровье & Спорт",
     emoji: "💪",
-    alias: ["health", "здоровье", "спорт"],
-    systemPrompt: `Ты — AI-специалист по здоровью, спорту, питанию и физическому состоянию.
-Отвечаешь только на русском языке. Давай конкретные советы с цифрами и примерами.
-
-Если тебе нужно мнение другого специалиста — добавь в ответ тег:
-[→ @finance: вопрос] — спросить финансового советника
-[→ @personal: вопрос] — спросить советника по личным делам
-
-Используй теги только когда это действительно нужно для полного ответа. Отвечай лаконично.`,
+    aliases: ["health", "здоровье", "спорт"],
+    systemPrompt:
+      "Ты — эксперт по здоровью, спорту и питанию. " +
+      "Отвечаешь коротко и по делу, только на русском. " +
+      "Давай конкретные цифры и практические рекомендации. " +
+      "Без вступлений и прощаний.",
   },
   finance: {
     id: "finance",
     name: "Финансы & Бизнес",
     emoji: "💰",
-    alias: ["finance", "финансы", "бизнес", "деньги"],
-    systemPrompt: `Ты — AI-специалист по личным финансам, инвестициям и бизнесу.
-Отвечаешь только на русском языке. Давай конкретные советы с цифрами и примерами.
-
-Если тебе нужно мнение другого специалиста — добавь в ответ тег:
-[→ @health: вопрос] — спросить советника по здоровью
-[→ @personal: вопрос] — спросить советника по личным делам
-
-Используй теги только когда это действительно нужно для полного ответа. Отвечай лаконично.`,
+    aliases: ["finance", "финансы", "бизнес", "деньги"],
+    systemPrompt:
+      "Ты — эксперт по личным финансам и бизнесу. " +
+      "Отвечаешь коротко и по делу, только на русском. " +
+      "Давай конкретные цифры и практические рекомендации. " +
+      "Без вступлений и прощаний.",
   },
   personal: {
     id: "personal",
     name: "Личные дела",
     emoji: "🧠",
-    alias: ["personal", "личные", "отношения", "жизнь"],
-    systemPrompt: `Ты — AI-советник по личным вопросам, отношениям, продуктивности и жизненным решениям.
-Отвечаешь только на русском языке. Давай конкретные, эмпатичные советы.
-
-Если тебе нужно мнение другого специалиста — добавь в ответ тег:
-[→ @health: вопрос] — спросить советника по здоровью
-[→ @finance: вопрос] — спросить финансового советника
-
-Используй теги только когда это действительно нужно для полного ответа. Отвечай лаконично.`,
+    aliases: ["personal", "личные", "отношения", "жизнь", "психология"],
+    systemPrompt:
+      "Ты — советник по личным вопросам, отношениям и продуктивности. " +
+      "Отвечаешь коротко и по делу, только на русском. " +
+      "Будь эмпатичным, давай конкретные практические советы. " +
+      "Без вступлений и прощаний.",
   },
 };
 
-const COORDINATOR_PROMPT = `Ты — координатор команды AI-советников. 
-Получаешь вопрос пользователя и всю дискуссию специалистов между собой.
-Задача: объединить их выводы в один связный финальный ответ на русском языке.
+// ── Main agent ───────────────────────────────────────────────────────────────
+
+const MAIN_AGENT_PROMPT = `Ты — Советник, умный персональный ассистент.
+У тебя есть три эксперта которых ты можешь привлечь:
+  💪 @health   — здоровье, спорт, питание
+  💰 @finance  — финансы, инвестиции, бизнес
+  🧠 @personal — личные вопросы, отношения, продуктивность
+
+Когда тебе нужна их экспертиза — вставь в ответ:
+  [→ @health: твой конкретный вопрос эксперту]
+  [→ @finance: твой конкретный вопрос эксперту]
+  [→ @personal: твой конкретный вопрос эксперту]
 
 Правила:
-- Выдели самое важное из обсуждения
-- Убери повторы, оставь суть
-- Пиши от первого лица множественного числа ("Мы рекомендуем...")
-- Максимум 8 предложений
-- Только текст, без markdown`;
+- Если вопрос простой и ты уверен — отвечай сам, не консультируй без нужды
+- Если вопрос требует экспертизы — сначала запроси мнение, потом дай итоговый ответ
+- На простые вопросы (погода, "как дела") отвечай просто и по-человечески
+- Отвечай ТОЛЬКО на русском языке
+- Итоговый ответ пиши от своего имени, не пересказывай экспертов дословно`;
 
-/** Resolve @mention alias to AgentId */
-function resolveAlias(mention: string): AgentId | null {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function resolveAlias(mention: string): SpecialistId | null {
   const m = mention.toLowerCase();
-  for (const agent of Object.values(AGENTS)) {
-    if (agent.alias.includes(m)) return agent.id;
+  for (const s of Object.values(SPECIALISTS)) {
+    if (s.aliases.includes(m)) return s.id;
   }
   return null;
 }
 
-/** Call one agent and return its text */
-async function callAgent(agent: Agent, messages: ChatMessage[]): Promise<string> {
-  const full: ChatMessage[] = [{ role: "system", content: agent.systemPrompt }, ...messages];
-  let result = "";
-  for await (const chunk of streamGroq(full)) result += chunk;
-  return result.trim();
+async function callLLM(messages: ChatMessage[]): Promise<string> {
+  let out = "";
+  for await (const chunk of streamGroq(messages)) out += chunk;
+  return out.trim();
 }
 
-export interface AgentTurn {
-  agent: Agent;
+// ── Public types ─────────────────────────────────────────────────────────────
+
+export interface Consultation {
+  specialist: Specialist;
   question: string;
   answer: string;
 }
 
-export interface MultiAgentResult {
-  turns: AgentTurn[];
-  finalAnswer: string;
-  isSingleAgent: boolean;
+export interface AgentResult {
+  consultations: Consultation[];
+  answer: string;
 }
 
-/**
- * Run a single agent directly (no synthesis).
- */
-export async function runSingleAgent(
-  agentId: AgentId,
-  userHistory: ChatMessage[],
-  onTurn: (turn: AgentTurn) => void,
-): Promise<MultiAgentResult> {
-  const agent = AGENTS[agentId];
-  const lastUserMsg = [...userHistory].reverse().find((m) => m.role === "user")?.content ?? "";
-
-  const turns: AgentTurn[] = [];
-
-  // Initial answer
-  let answer = await callAgent(agent, userHistory);
-  const cleaned = answer.replace(AGENT_QUESTION_RE, "").trim();
-  const firstTurn: AgentTurn = { agent, question: lastUserMsg, answer: cleaned };
-  turns.push(firstTurn);
-  onTurn(firstTurn);
-
-  // Handle cross-agent questions from this agent
-  let round = 0;
-  let pendingAnswer = answer;
-
-  while (round < MAX_ROUNDS) {
-    const matches = [...pendingAnswer.matchAll(AGENT_QUESTION_RE)];
-    if (!matches.length) break;
-
-    let hasNew = false;
-    for (const match of matches) {
-      const targetId = resolveAlias(match[1]);
-      if (!targetId || targetId === agentId) continue;
-
-      const targetAgent = AGENTS[targetId];
-      const question = match[2].trim();
-      const targetMessages: ChatMessage[] = [
-        ...userHistory,
-        { role: "user", content: `Коллега спрашивает: ${question}` },
-      ];
-      const targetAnswer = await callAgent(targetAgent, targetMessages);
-      const turn: AgentTurn = { agent: targetAgent, question, answer: targetAnswer.replace(AGENT_QUESTION_RE, "").trim() };
-      turns.push(turn);
-      onTurn(turn);
-      pendingAnswer = targetAnswer;
-      hasNew = true;
-    }
-
-    if (!hasNew) break;
-    round++;
-  }
-
-  return { turns, finalAnswer: cleaned, isSingleAgent: true };
-}
+// ── Orchestrator ─────────────────────────────────────────────────────────────
 
 /**
- * Run all agents, allow them to discuss, then synthesize.
+ * Run the main agent for one user turn.
+ * @param history  Full conversation history (including the latest user message)
+ * @param onConsult  Called each time a specialist answers (for live UI updates)
  */
-export async function runMultiAgent(
-  userHistory: ChatMessage[],
-  onTurn: (turn: AgentTurn) => void,
-): Promise<MultiAgentResult> {
-  const lastUserMsg = [...userHistory].reverse().find((m) => m.role === "user")?.content ?? "";
-  const turns: AgentTurn[] = [];
+export async function runAgent(
+  history: ChatMessage[],
+  onConsult?: (c: Consultation) => void,
+): Promise<AgentResult> {
+  const consultations: Consultation[] = [];
 
-  // Round 0: all agents answer the user in parallel
-  const initialAnswers = await Promise.all(
-    Object.values(AGENTS).map(async (agent) => {
-      const answer = await callAgent(agent, userHistory);
-      return { agent, answer };
-    })
-  );
-
-  // Collect cross-agent questions from round 0
-  const pendingQuestions: { from: Agent; targetId: AgentId; question: string }[] = [];
-
-  for (const { agent, answer } of initialAnswers) {
-    const cleaned = answer.replace(AGENT_QUESTION_RE, "").trim();
-    const turn: AgentTurn = { agent, question: lastUserMsg, answer: cleaned };
-    turns.push(turn);
-    onTurn(turn);
-
-    for (const match of answer.matchAll(AGENT_QUESTION_RE)) {
-      const targetId = resolveAlias(match[1]);
-      if (targetId && targetId !== agent.id) {
-        pendingQuestions.push({ from: agent, targetId, question: match[2].trim() });
-      }
-    }
-  }
-
-  // Rounds 1..MAX_ROUNDS: resolve cross-agent questions
-  let round = 0;
-  let queue = pendingQuestions;
-
-  while (queue.length && round < MAX_ROUNDS) {
-    const nextQueue: typeof queue = [];
-
-    const results = await Promise.all(
-      queue.map(async ({ from, targetId, question }) => {
-        const targetAgent = AGENTS[targetId];
-        const messages: ChatMessage[] = [
-          ...userHistory,
-          { role: "user", content: `${from.emoji} ${from.name} спрашивает тебя: ${question}` },
-        ];
-        const answer = await callAgent(targetAgent, messages);
-        return { from, targetAgent, question, answer };
-      })
-    );
-
-    for (const { from, targetAgent, question, answer } of results) {
-      const cleaned = answer.replace(AGENT_QUESTION_RE, "").trim();
-      const turn: AgentTurn = {
-        agent: targetAgent,
-        question: `${from.emoji} спрашивает: ${question}`,
-        answer: cleaned,
-      };
-      turns.push(turn);
-      onTurn(turn);
-
-      for (const match of answer.matchAll(AGENT_QUESTION_RE)) {
-        const nextTargetId = resolveAlias(match[1]);
-        if (nextTargetId && nextTargetId !== targetAgent.id) {
-          nextQueue.push({ from: targetAgent, targetId: nextTargetId, question: match[2].trim() });
-        }
-      }
-    }
-
-    queue = nextQueue;
-    round++;
-  }
-
-  // Final synthesis
-  const discussion = turns
-    .map((t) => `[${t.agent.emoji} ${t.agent.name}] ${t.question}\n→ ${t.answer}`)
-    .join("\n\n");
-
-  const coordinatorMessages: ChatMessage[] = [
-    { role: "system", content: COORDINATOR_PROMPT },
-    {
-      role: "user",
-      content: `Вопрос пользователя: "${lastUserMsg}"\n\nДискуссия:\n${discussion}`,
-    },
+  // Build main-agent message list
+  let mainMessages: ChatMessage[] = [
+    { role: "system", content: MAIN_AGENT_PROMPT },
+    ...history,
   ];
 
-  let finalAnswer = "";
-  for await (const chunk of streamGroq(coordinatorMessages)) finalAnswer += chunk;
+  let round = 0;
 
-  return { turns, finalAnswer: finalAnswer.trim(), isSingleAgent: false };
+  while (round <= MAX_ROUNDS) {
+    const response = await callLLM(mainMessages);
+
+    // Find all consultation tags
+    const matches = [...response.matchAll(CONSULT_RE)];
+    if (!matches.length) {
+      // No more consultations needed — clean response is the final answer
+      const clean = response.replace(CONSULT_RE, "").trim();
+      return { consultations, answer: clean };
+    }
+
+    // Call specialists in parallel
+    const pending = matches
+      .map((m) => ({ id: resolveAlias(m[1]), question: m[2].trim(), raw: m[0] }))
+      .filter((p): p is typeof p & { id: SpecialistId } => p.id !== null);
+
+    const results = await Promise.all(
+      pending.map(async ({ id, question }) => {
+        const specialist = SPECIALISTS[id];
+        const answer = await callLLM([
+          { role: "system", content: specialist.systemPrompt },
+          // Give specialist the full user context
+          ...history,
+          { role: "user", content: question },
+        ]);
+        return { specialist, question, answer };
+      }),
+    );
+
+    // Record and notify
+    for (const c of results) {
+      consultations.push(c);
+      onConsult?.(c);
+    }
+
+    // Inject specialist answers back into the main agent's context
+    const consultBlock = results
+      .map((c) => `[Ответ ${c.specialist.emoji} ${c.specialist.name}]: ${c.answer}`)
+      .join("\n\n");
+
+    // Add the main agent's partial response + specialist answers as assistant turn
+    mainMessages = [
+      ...mainMessages,
+      { role: "assistant", content: response },
+      {
+        role: "user",
+        content:
+          `Эксперты ответили:\n\n${consultBlock}\n\n` +
+          "Теперь дай итоговый ответ пользователю, учитывая их мнение. " +
+          "Не используй теги консультаций.",
+      },
+    ];
+
+    round++;
+  }
+
+  // Safety fallback: call one more time without tags allowed
+  const fallback = await callLLM([
+    ...mainMessages,
+    {
+      role: "user",
+      content: "Дай финальный ответ пользователю без тегов консультаций.",
+    },
+  ]);
+  return { consultations, answer: fallback.replace(CONSULT_RE, "").trim() };
 }

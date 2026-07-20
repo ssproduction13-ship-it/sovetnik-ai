@@ -4,16 +4,11 @@ import { db } from "@workspace/db";
 import { conversations, messages, telegramSessions } from "@workspace/db";
 import { eq, asc } from "drizzle-orm";
 import { logger } from "./logger";
-import {
-  runMultiAgent,
-  runSingleAgent,
-  AGENTS,
-  type AgentId,
-  type AgentTurn,
-  type ChatMessage,
-} from "./agents";
+import { runAgent, type ChatMessage, type Consultation } from "./agents";
 
-async function getOrCreateConversation(chatId: number, chatTitle: string): Promise<number> {
+// ── DB helpers ────────────────────────────────────────────────────────────────
+
+async function getOrCreateConversation(chatId: number, name: string): Promise<number> {
   const existing = await db.query.telegramSessions.findFirst({
     where: eq(telegramSessions.telegramChatId, chatId),
   });
@@ -21,7 +16,7 @@ async function getOrCreateConversation(chatId: number, chatTitle: string): Promi
 
   const [conv] = await db
     .insert(conversations)
-    .values({ title: `Telegram: ${chatTitle}` })
+    .values({ title: `Telegram: ${name}` })
     .returning();
 
   await db.insert(telegramSessions).values({
@@ -32,18 +27,7 @@ async function getOrCreateConversation(chatId: number, chatTitle: string): Promi
   return conv.id;
 }
 
-/** Build the live message text from accumulated turns */
-function buildDiscussionText(turns: AgentTurn[], done = false): string {
-  const lines = turns.map((t) => {
-    const from = t.question.includes("спрашивает")
-      ? `   ↗️ ${t.question}\n   ${t.agent.emoji} ${t.agent.name}: ${t.answer}`
-      : `${t.agent.emoji} ${t.agent.name}:\n${t.answer}`;
-    return from;
-  });
-
-  if (!done) return lines.join("\n\n") + "\n\n⏳ ...";
-  return lines.join("\n\n");
-}
+// ── Telegram bot ──────────────────────────────────────────────────────────────
 
 export function startTelegramBot(): void {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -54,131 +38,67 @@ export function startTelegramBot(): void {
 
   const bot = new Telegraf(token);
 
-  // ── /start ──────────────────────────────────────────────────────────────
   bot.start(async (ctx) => {
     await ctx.reply(
-      "Привет! Я Советник — команда из трёх AI-специалистов.\n\n" +
-      "💪 /health — Здоровье & Спорт\n" +
-      "💰 /finance — Финансы & Бизнес\n" +
-      "🧠 /personal — Личные дела\n\n" +
-      "Просто напиши вопрос — все трое обсудят вместе.\n" +
-      "Или начни с команды, чтобы обратиться к конкретному специалисту.\n\n" +
-      "/new — новый разговор  |  /help — справка"
-    );
-  });
-
-  // ── /help ────────────────────────────────────────────────────────────────
-  bot.command("help", async (ctx) => {
-    await ctx.reply(
-      "Команды:\n\n" +
-      "💪 /health [вопрос] — спросить специалиста по здоровью\n" +
-      "💰 /finance [вопрос] — спросить финансового советника\n" +
-      "🧠 /personal [вопрос] — спросить по личным делам\n\n" +
-      "Без команды — все трое обсуждают вместе.\n" +
-      "Агенты могут сами обращаться друг к другу если нужно.\n\n" +
+      "Привет! Я Советник.\n\n" +
+      "Задай любой вопрос — я отвечу сам или привлеку нужного эксперта:\n" +
+      "💪 Здоровье & Спорт\n" +
+      "💰 Финансы & Бизнес\n" +
+      "🧠 Личные дела\n\n" +
       "/new — начать новый разговор"
     );
   });
 
-  // ── /new ─────────────────────────────────────────────────────────────────
+  bot.command("help", async (ctx) => {
+    await ctx.reply(
+      "Просто пиши — я сам решу, нужна ли консультация экспертов.\n\n" +
+      "/new — очистить историю разговора"
+    );
+  });
+
   bot.command("new", async (ctx) => {
     const chatId = ctx.chat.id;
+    const name = ctx.from?.first_name ?? String(chatId);
+    const [conv] = await db
+      .insert(conversations)
+      .values({ title: `Telegram: ${name}` })
+      .returning();
+
     const existing = await db.query.telegramSessions.findFirst({
       where: eq(telegramSessions.telegramChatId, chatId),
     });
+
     if (existing) {
-      const name = ctx.from?.first_name ?? "чат";
-      const [conv] = await db
-        .insert(conversations)
-        .values({ title: `Telegram: ${name}` })
-        .returning();
       await db
         .update(telegramSessions)
         .set({ conversationId: conv.id })
         .where(eq(telegramSessions.telegramChatId, chatId));
+    } else {
+      await db.insert(telegramSessions).values({ telegramChatId: chatId, conversationId: conv.id });
     }
-    await ctx.reply("Начат новый разговор. История предыдущего сохранена.");
+
+    await ctx.reply("Начат новый разговор.");
   });
 
-  // ── Handler for single-agent commands (/health, /finance, /personal) ────
-  async function handleAgentCommand(
-    ctx: Parameters<Parameters<typeof bot.command>[1]>[0],
-    agentId: AgentId,
-  ) {
-    const chatId = ctx.chat.id;
-    const chatTitle = ctx.from?.first_name ?? String(chatId);
-
-    // Extract question from command args
-    const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
-    const userText = text.replace(/^\/\w+\s*/, "").trim();
-
-    if (!userText) {
-      const agent = AGENTS[agentId];
-      await ctx.reply(`${agent.emoji} ${agent.name} слушает. Напиши свой вопрос после команды.\nПример: /${agentId} Как улучшить сон?`);
-      return;
-    }
-
-    await ctx.sendChatAction("typing");
-
-    try {
-      const conversationId = await getOrCreateConversation(chatId, chatTitle);
-      await db.insert(messages).values({ conversationId, role: "user", content: userText });
-
-      const history = await db.select().from(messages)
-        .where(eq(messages.conversationId, conversationId))
-        .orderBy(asc(messages.createdAt));
-
-      const chatMessages: ChatMessage[] = history.map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      }));
-
-      const turns: AgentTurn[] = [];
-      const statusMsg = await ctx.reply(`${AGENTS[agentId].emoji} думает...`);
-
-      const { finalAnswer } = await runSingleAgent(agentId, chatMessages, async (turn) => {
-        turns.push(turn);
-        try {
-          await ctx.telegram.editMessageText(
-            chatId, statusMsg.message_id, undefined,
-            buildDiscussionText(turns, false)
-          );
-        } catch { /* ignore */ }
-      });
-
-      const fullMessage = buildDiscussionText(turns, true);
-
-      try {
-        await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined, fullMessage);
-      } catch {
-        await ctx.reply(fullMessage);
-      }
-
-      await db.insert(messages).values({ conversationId, role: "assistant", content: fullMessage });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error({ err }, "Telegram bot error");
-      await ctx.reply(`Произошла ошибка: ${errMsg}`);
-    }
-  }
-
-  bot.command("health",   (ctx) => handleAgentCommand(ctx, "health"));
-  bot.command("finance",  (ctx) => handleAgentCommand(ctx, "finance"));
-  bot.command("personal", (ctx) => handleAgentCommand(ctx, "personal"));
-
-  // ── Text messages → all agents discuss ───────────────────────────────────
   bot.on(message("text"), async (ctx) => {
     const chatId = ctx.chat.id;
     const userText = ctx.message.text;
-    const chatTitle = ctx.from?.first_name ?? String(chatId);
+    const name = ctx.from?.first_name ?? String(chatId);
 
     await ctx.sendChatAction("typing");
 
     try {
-      const conversationId = await getOrCreateConversation(chatId, chatTitle);
-      await db.insert(messages).values({ conversationId, role: "user", content: userText });
+      const conversationId = await getOrCreateConversation(chatId, name);
 
-      const history = await db.select().from(messages)
+      await db.insert(messages).values({
+        conversationId,
+        role: "user",
+        content: userText,
+      });
+
+      const history = await db
+        .select()
+        .from(messages)
         .where(eq(messages.conversationId, conversationId))
         .orderBy(asc(messages.createdAt));
 
@@ -187,41 +107,68 @@ export function startTelegramBot(): void {
         content: m.content,
       }));
 
-      const turns: AgentTurn[] = [];
-      const statusMsg = await ctx.reply("💪 💰 🧠 Специалисты обсуждают...");
+      // Show thinking indicator
+      const statusMsg = await ctx.reply("⏳");
 
-      const { finalAnswer } = await runMultiAgent(chatMessages, async (turn) => {
-        turns.push(turn);
+      // Collect consultations for live updates
+      const consultations: Consultation[] = [];
+
+      const { answer } = await runAgent(chatMessages, async (consultation) => {
+        consultations.push(consultation);
+
+        // Update status to show which expert is being consulted
+        const consulting = consultations
+          .map((c) => `${c.specialist.emoji} ${c.specialist.name}`)
+          .join(", ");
+
         try {
           await ctx.telegram.editMessageText(
-            chatId, statusMsg.message_id, undefined,
-            buildDiscussionText(turns, false)
+            chatId,
+            statusMsg.message_id,
+            undefined,
+            `⏳ Консультирую: ${consulting}...`
           );
-        } catch { /* ignore */ }
+        } catch { /* ignore edit errors */ }
       });
 
-      const discussion = buildDiscussionText(turns, true);
-      const fullMessage = `${discussion}\n\n─────────────────\n✅ Общий ответ:\n\n${finalAnswer}`;
+      // Build final message: consultations (if any) + main answer
+      let fullMessage = "";
+
+      if (consultations.length > 0) {
+        const consultBlock = consultations
+          .map((c) => `${c.specialist.emoji} ${c.specialist.name}:\n${c.answer}`)
+          .join("\n\n");
+        fullMessage = `${consultBlock}\n\n─────────────────\n${answer}`;
+      } else {
+        fullMessage = answer;
+      }
 
       try {
-        await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined, fullMessage);
+        await ctx.telegram.editMessageText(
+          chatId,
+          statusMsg.message_id,
+          undefined,
+          fullMessage
+        );
       } catch {
         await ctx.reply(fullMessage);
       }
 
-      await db.insert(messages).values({ conversationId, role: "assistant", content: fullMessage });
+      await db.insert(messages).values({
+        conversationId,
+        role: "assistant",
+        content: fullMessage,
+      });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Telegram bot error");
-      await ctx.reply(`Произошла ошибка: ${errMsg}`);
+      await ctx.reply(`Ошибка: ${errMsg}`);
     }
   });
 
-  bot.launch().then(() => {
-    logger.info("Telegram bot started (polling)");
-  }).catch((err) => {
-    logger.error({ err }, "Failed to start Telegram bot");
-  });
+  bot.launch()
+    .then(() => logger.info("Telegram bot started"))
+    .catch((err) => logger.error({ err }, "Failed to start Telegram bot"));
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
