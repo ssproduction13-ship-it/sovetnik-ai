@@ -34,4 +34,45 @@ export async function runMigrations(): Promise<void> {
       created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  // Add pending_intent column to existing telegram_sessions (idempotent)
+  await db.execute(sql`
+    ALTER TABLE telegram_sessions
+    ADD COLUMN IF NOT EXISTS pending_intent TEXT
+  `);
+
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS expenses (
+      id               SERIAL PRIMARY KEY,
+      telegram_chat_id BIGINT NOT NULL,
+      amount           INTEGER NOT NULL,
+      category         TEXT NOT NULL,
+      date             TEXT NOT NULL,
+      note             TEXT,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS workouts (
+      id               SERIAL PRIMARY KEY,
+      telegram_chat_id BIGINT NOT NULL,
+      date             TEXT NOT NULL,
+      type             TEXT NOT NULL,
+      details          TEXT NOT NULL,
+      note             TEXT,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id               SERIAL PRIMARY KEY,
+      telegram_chat_id BIGINT NOT NULL,
+      text             TEXT NOT NULL,
+      due_date         TEXT,
+      status           TEXT NOT NULL DEFAULT 'active',
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 }

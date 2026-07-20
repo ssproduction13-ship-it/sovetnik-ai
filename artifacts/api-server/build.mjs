@@ -100,6 +100,8 @@ async function buildAll() {
       "puppeteer",
       "puppeteer-core",
       "electron",
+      // pdf-parse reads test files relative to its own path at runtime — must stay external
+      "pdf-parse",
     ],
     sourcemap: "linked",
     plugins: [
