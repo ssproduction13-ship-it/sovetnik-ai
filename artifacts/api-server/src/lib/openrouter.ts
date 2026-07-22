@@ -11,8 +11,8 @@
 import { type ChatMessage, type ContentPart } from "./groq";
 export type { ChatMessage, ContentPart };
 
-const MODEL        = "google/gemini-2.5-flash:free";
-const VISION_MODEL = "google/gemini-2.5-flash:free";
+const MODEL        = "qwen/qwen3-235b-a22b:free";
+const VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free";
 const MAX_TOKENS   = 8192;
 const MAX_RETRIES  = 4;
 
