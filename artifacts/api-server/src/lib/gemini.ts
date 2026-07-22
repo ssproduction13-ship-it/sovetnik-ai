@@ -11,6 +11,9 @@ export interface GeminiMessage {
   parts: GeminiPart[];
 }
 
+const MAX_RETRIES = 4;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export async function* streamGemini(
   messages: GeminiMessage[],
   systemInstruction: string,
@@ -22,19 +25,41 @@ export async function* streamGemini(
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: systemInstruction }] },
-      contents: messages,
-      generationConfig: { maxOutputTokens },
-    }),
-  });
+  let res: Response | null = null;
+  let attempt = 0;
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${body}`);
+  while (attempt <= MAX_RETRIES) {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: systemInstruction }] },
+        contents: messages,
+        generationConfig: { maxOutputTokens },
+      }),
+    });
+
+    if (res.status === 429) {
+      if (attempt === MAX_RETRIES) {
+        const body = await res.text();
+        throw new Error(`Gemini API error 429: ${body}`);
+      }
+      // Respect Retry-After header, fall back to exponential back-off
+      const retryAfter = res.headers.get("retry-after");
+      const waitMs = retryAfter
+        ? parseFloat(retryAfter) * 1000
+        : Math.min(30_000, 2 ** attempt * 5_000); // 5s, 10s, 20s, 30s
+      attempt++;
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Gemini API error ${res.status}: ${body}`);
+    }
+
+    break;
   }
 
   const reader = res.body!.getReader();
