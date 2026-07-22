@@ -11,7 +11,7 @@
 import { type ChatMessage, type ContentPart } from "./groq";
 export type { ChatMessage, ContentPart };
 
-const MODEL        = "qwen/qwen3-235b-a22b:free";
+const MODEL        = "deepseek/deepseek-chat-v3-0324:free";
 const VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free";
 const MAX_TOKENS   = 8192;
 const MAX_RETRIES  = 4;
