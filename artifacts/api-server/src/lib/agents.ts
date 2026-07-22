@@ -15,45 +15,14 @@
  */
 
 import { type ChatMessage, type ContentPart } from "./groq";
-import { streamGemini, type GeminiPart, type GeminiMessage } from "./gemini";
+import { streamOpenRouter } from "./openrouter";
 import { executeTool } from "./tools";
 export type { ChatMessage, ContentPart };
 
-// ── Gemini adapter ────────────────────────────────────────────────────────
-
-function toGemini(messages: ChatMessage[]): { system: string; msgs: GeminiMessage[] } {
-  let system = "";
-  const msgs: GeminiMessage[] = [];
-
-  for (const m of messages) {
-    if (m.role === "system") {
-      system += (system ? "\n\n" : "") + (typeof m.content === "string" ? m.content : "");
-      continue;
-    }
-    const role = m.role === "assistant" ? "model" : "user";
-    if (typeof m.content === "string") {
-      msgs.push({ role, parts: [{ text: m.content }] });
-    } else {
-      const parts: GeminiPart[] = (m.content as ContentPart[]).map((p) => {
-        if (p.type === "text") return { text: p.text };
-        const url = p.image_url.url;
-        if (url.startsWith("data:")) {
-          const [meta, data] = url.split(",");
-          const mimeType = meta.replace("data:", "").replace(";base64", "");
-          return { inlineData: { mimeType, data } };
-        }
-        return { text: `[image: ${url}]` };
-      });
-      msgs.push({ role, parts });
-    }
-  }
-
-  return { system, msgs };
-}
+// ── AI provider wrapper ───────────────────────────────────────────────────
 
 async function* streamAI(messages: ChatMessage[]): AsyncGenerator<string> {
-  const { system, msgs } = toGemini(messages);
-  yield* streamGemini(msgs, system);
+  yield* streamOpenRouter(messages);
 }
 
 // ── Specialist hiring ─────────────────────────────────────────────────────
