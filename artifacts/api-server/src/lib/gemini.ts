@@ -2,20 +2,25 @@
  * Minimal Gemini streaming client using fetch — no SDK dependency.
  */
 
+export type GeminiPart =
+  | { text: string }
+  | { inlineData: { mimeType: string; data: string } };
+
 export interface GeminiMessage {
   role: "user" | "model";
-  parts: { text: string }[];
+  parts: GeminiPart[];
 }
 
 export async function* streamGemini(
   messages: GeminiMessage[],
   systemInstruction: string,
+  maxOutputTokens = 8192,
 ): AsyncGenerator<string> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY must be set in Railway variables");
 
   const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:streamGenerateContent?alt=sse&key=${apiKey}`;
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -23,7 +28,7 @@ export async function* streamGemini(
     body: JSON.stringify({
       system_instruction: { parts: [{ text: systemInstruction }] },
       contents: messages,
-      generationConfig: { maxOutputTokens: 8192 },
+      generationConfig: { maxOutputTokens },
     }),
   });
 

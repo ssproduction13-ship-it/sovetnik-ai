@@ -14,9 +14,47 @@
  *   — clarifying questions ([ASK_USER:question]) → pending_intent (ТЗ §4)
  */
 
-import { streamGroq, type ChatMessage, type ContentPart } from "./groq";
+import { type ChatMessage, type ContentPart } from "./groq";
+import { streamGemini, type GeminiPart, type GeminiMessage } from "./gemini";
 import { executeTool } from "./tools";
 export type { ChatMessage, ContentPart };
+
+// ── Gemini adapter ────────────────────────────────────────────────────────
+
+function toGemini(messages: ChatMessage[]): { system: string; msgs: GeminiMessage[] } {
+  let system = "";
+  const msgs: GeminiMessage[] = [];
+
+  for (const m of messages) {
+    if (m.role === "system") {
+      system += (system ? "\n\n" : "") + (typeof m.content === "string" ? m.content : "");
+      continue;
+    }
+    const role = m.role === "assistant" ? "model" : "user";
+    if (typeof m.content === "string") {
+      msgs.push({ role, parts: [{ text: m.content }] });
+    } else {
+      const parts: GeminiPart[] = (m.content as ContentPart[]).map((p) => {
+        if (p.type === "text") return { text: p.text };
+        const url = p.image_url.url;
+        if (url.startsWith("data:")) {
+          const [meta, data] = url.split(",");
+          const mimeType = meta.replace("data:", "").replace(";base64", "");
+          return { inlineData: { mimeType, data } };
+        }
+        return { text: `[image: ${url}]` };
+      });
+      msgs.push({ role, parts });
+    }
+  }
+
+  return { system, msgs };
+}
+
+async function* streamAI(messages: ChatMessage[]): AsyncGenerator<string> {
+  const { system, msgs } = toGemini(messages);
+  yield* streamGemini(msgs, system);
+}
 
 // ── Specialist hiring ─────────────────────────────────────────────────────
 
@@ -53,7 +91,7 @@ async function spawnSpecialist(
     { role: "user", content: userMessage ? `Контекст: ${userMessage}\n\nВопрос коллеги: ${question}` : question },
   ];
   let out = "";
-  for await (const chunk of streamGroq(msgs, 300)) out += chunk;
+  for await (const chunk of streamAI(msgs)) out += chunk;
   return out.trim();
 }
 
@@ -199,7 +237,7 @@ for (const agent of Object.values(AGENTS)) {
 async function callAgent(agent: Agent, messages: ChatMessage[]): Promise<string> {
   const full: ChatMessage[] = [{ role: "system", content: agent.systemPrompt }, ...messages];
   let result = "";
-  for await (const chunk of streamGroq(full)) result += chunk;
+  for await (const chunk of streamAI(full)) result += chunk;
   return result.trim();
 }
 
@@ -224,7 +262,7 @@ async function callAgentWithTools(
 
   // ── First pass ────────────────────────────────────────────────────────
   let firstPass = "";
-  for await (const chunk of streamGroq(full)) firstPass += chunk;
+  for await (const chunk of streamAI(full)) firstPass += chunk;
   firstPass = firstPass.trim();
 
   // ── ASK_USER → pending_intent, no agent response ──────────────────────
@@ -273,7 +311,7 @@ async function callAgentWithTools(
   ];
 
   let finalPass = "";
-  for await (const chunk of streamGroq(finalMessages)) finalPass += chunk;
+  for await (const chunk of streamAI(finalMessages)) finalPass += chunk;
   return { answer: finalPass.trim() };
 }
 
@@ -362,7 +400,7 @@ export async function runDiscussion(
       { role: "user", content: `Выскажись по теме: ${topic}` },
     ];
     let result = "";
-    for await (const chunk of streamGroq(messages)) result += chunk;
+    for await (const chunk of streamAI(messages)) result += chunk;
     const answer = result.trim();
     const turn: AgentAnswer = { agent, answer };
     turns.push(turn);
@@ -409,7 +447,7 @@ export async function runReactions(allAnswers: AgentAnswer[]): Promise<Reaction[
       const others = allAnswers.filter((a) => a.agent.id !== myAnswer.agent.id);
       const systemPrompt = REACTION_SYSTEM(myAnswer.agent, others);
       let raw = "";
-      for await (const chunk of streamGroq([
+      for await (const chunk of streamAI([
         { role: "system", content: systemPrompt },
         { role: "user", content: "Твоя реакция:" },
       ])) raw += chunk;
@@ -439,7 +477,7 @@ export async function answerQuestion(
 ): Promise<AgentQuestionAnswer> {
   const system = `Тебя зовут ${q.to.firstName}. ${q.to.systemPrompt}\nКоллега ${q.from.firstName} задаёт тебе вопрос. Отвечай по существу, максимум 4 предложения. Без markdown.`;
   let answer = "";
-  for await (const chunk of streamGroq([
+  for await (const chunk of streamAI([
     { role: "system", content: system },
     { role: "user", content: q.text },
   ])) answer += chunk;
@@ -512,7 +550,7 @@ export async function runManager(
   ];
 
   let firstPass = "";
-  for await (const chunk of streamGroq(messages)) firstPass += chunk;
+  for await (const chunk of streamAI(messages)) firstPass += chunk;
   firstPass = firstPass.trim();
 
   // ── ROUTE — hand off to specialist ───────────────────────────────────
@@ -561,7 +599,7 @@ export async function runManager(
     ];
 
     let synthesis = "";
-    for await (const chunk of streamGroq(synthMessages)) synthesis += chunk;
+    for await (const chunk of streamAI(synthMessages)) synthesis += chunk;
     return { kind: "consult", results: consultResults, synthesis: synthesis.trim() };
   }
 
