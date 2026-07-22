@@ -11,7 +11,7 @@
 import { type ChatMessage, type ContentPart } from "./groq";
 export type { ChatMessage, ContentPart };
 
-const MODEL        = "google/gemma-4-31b-it:free";
+const MODEL        = "nvidia/nemotron-3-super-120b-a12b:free";
 const VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free";
 const MAX_TOKENS   = 8192;
 const MAX_RETRIES  = 4;
