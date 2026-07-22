@@ -45,7 +45,7 @@ export async function* streamOpenRouter(
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
         "HTTP-Referer": "https://github.com/ssproduction13-ship-it/sovetnik-ai",
-        "X-Title": "Советник AI",
+        "X-Title": "Sovetnik AI",
       },
       body: JSON.stringify({
         model,
